@@ -19,7 +19,7 @@ class BruteforceSearch : public AlgorithmInterface<dist_t> {
     void *dist_func_param_;
     std::mutex index_lock;
 
-    std::unordered_map<labeltype, size_t > dict_external_to_internal;
+    std::unordered_map<labeltype, size_t> dict_external_to_internal;
 
 
     BruteforceSearch(SpaceInterface <dist_t> *s)
@@ -61,7 +61,8 @@ class BruteforceSearch : public AlgorithmInterface<dist_t> {
     }
 
 
-    void addPoint(const void *datapoint, labeltype label, bool replace_deleted = false) {
+    void addPoint(const void *datapoint, labeltype label, bool replace_deleted = false)
+    {
         int idx;
         {
             std::unique_lock<std::mutex> lock(index_lock);
@@ -133,7 +134,6 @@ class BruteforceSearch : public AlgorithmInterface<dist_t> {
         }
         return topResults;
     }
-
 
     void saveIndex(const std::string &location) {
         std::ofstream output(location, std::ios::binary);

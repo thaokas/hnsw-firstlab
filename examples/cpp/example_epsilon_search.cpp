@@ -1,4 +1,5 @@
 #include "../../hnswlib/hnswlib.h"
+#include "hnswlib/assit.h"
 
 typedef unsigned int docidtype;
 typedef float dist_t;
@@ -17,7 +18,7 @@ int main() {
 
     // Initing index
     hnswlib::L2Space space(dim);
-    hnswlib::HierarchicalNSW<dist_t>* alg_hnsw = new hnswlib::HierarchicalNSW<dist_t>(&space, max_elements, M, ef_construction);
+    hnswlib::HierarchicalNSW<dist_t>* alg_hnsw = new hnswlib::HierarchicalNSW<dist_t>(&space, max_elements, M, ef_construction, hnswlib::divint(0));
 
     // Generate random data
     std::mt19937 rng;
@@ -41,6 +42,11 @@ int main() {
         char* point_data = data + i * data_point_size;
         alg_hnsw->addPoint(point_data, label);
     }
+
+    // 实验用的辅助类，实例化一个对象
+    hnswlib::DatabaseStructure<dist_t> * assist = new hnswlib::DatabaseStructure<dist_t>();
+    assist->print_db_structure(alg_hnsw);
+
 
     // Query random vectors
     for (int i = 0; i < num_queries; i++) {

@@ -15,10 +15,13 @@ namespace {
 using idx_t = hnswlib::labeltype;
 
 void test() {
-    int d = 4;
-    idx_t n = 100;
-    idx_t nq = 10;
-    size_t k = 10;
+    int d = 16;
+    idx_t n = 10000;
+    idx_t nq = 100;
+    size_t k = 5;
+    size_t max_elements = 2 * n;
+    hnswlib::divint lv_div_strategy = 0;
+    size_t device_number = 30;
 
     std::vector<float> data(n * d);
     std::vector<float> query(nq * d);
@@ -35,35 +38,26 @@ void test() {
     }
 
     hnswlib::L2Space space(d);
-    hnswlib::AlgorithmInterface<float>* alg_brute  = new hnswlib::BruteforceSearch<float>(&space, 2 * n);
-    hnswlib::AlgorithmInterface<float>* alg_hnsw = new hnswlib::HierarchicalNSW<float>(&space, 2 * n);
+    hnswlib::AlgorithmInterface<float>* alg_brute  = new hnswlib::BruteforceSearch<float>(&space, max_elements);
+    hnswlib::AlgorithmInterface<float>* alg_hnsw = new hnswlib::HierarchicalNSW<float>(&space, max_elements, 16, 200, lv_div_strategy, device_number);
 
     for (size_t i = 0; i < n; ++i) {
         alg_brute->addPoint(data.data() + d * i, i);
         alg_hnsw->addPoint(data.data() + d * i, i);
     }
 
-    // test searchKnnCloserFirst of BruteforceSearch
     for (size_t j = 0; j < nq; ++j) {
         const void* p = query.data() + j * d;
-        auto gd = alg_brute->searchKnn(p, k);
-        auto res = alg_brute->searchKnnCloserFirst(p, k);
-        assert(gd.size() == res.size());
-        size_t t = gd.size();
-        while (!gd.empty()) {
-            assert(gd.top() == res[--t]);
-            gd.pop();
-        }
-    }
-    for (size_t j = 0; j < nq; ++j) {
-        const void* p = query.data() + j * d;
-        auto gd = alg_hnsw->searchKnn(p, k);
-        auto res = alg_hnsw->searchKnnCloserFirst(p, k);
-        assert(gd.size() == res.size());
-        size_t t = gd.size();
-        while (!gd.empty()) {
-            assert(gd.top() == res[--t]);
-            gd.pop();
+        auto res_h = alg_hnsw->searchKnn(p, k);
+        auto res_b = alg_brute->searchKnn(p, k);
+        assert(res_b.size() == res_h.size());
+        size_t t = res_h.size();
+        for (int i = 0; i < t; ++i)
+        {
+            assert(res_b.top() == res_h.top());
+            std::cout << "[ " << res_h.top().first << " | " << res_b.top().first << " ]" << std::endl;
+            res_h.pop();
+            res_b.pop();
         }
     }
 

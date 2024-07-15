@@ -1,4 +1,5 @@
 #include "../../hnswlib/hnswlib.h"
+#include "hnswlib/assit.h"
 
 
 int main() {
@@ -26,6 +27,9 @@ int main() {
         alg_hnsw->addPoint(data + i * dim, i);
     }
 
+    auto assist = new hnswlib::DatabaseStructure<float>();
+    assist->print_db_structure(alg_hnsw);
+
     // Query the elements for themselves and measure recall
     float correct = 0;
     for (int i = 0; i < max_elements; i++) {
@@ -35,6 +39,11 @@ int main() {
     }
     float recall = correct / max_elements;
     std::cout << "Recall: " << recall << "\n";
+
+
+    hnswlib::TrackMap<float>* record = new hnswlib::TrackMap<float>();
+    record->print_track_info(alg_hnsw);
+
 
     // Serialize index
     std::string hnsw_path = "hnsw.bin";
@@ -51,6 +60,8 @@ int main() {
     }
     recall = (float)correct / max_elements;
     std::cout << "Recall of deserialized index: " << recall << "\n";
+
+
 
     delete[] data;
     delete alg_hnsw;

@@ -48,12 +48,22 @@ if(HNSWLIB_EXAMPLES)
         endif()
       endif()
     elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-      SET( CMAKE_CXX_FLAGS  "-Ofast -lrt -std=c++11 -DHAVE_CXX0X -march=native -fpic -w -fopenmp -ftree-vectorize -ftree-vectorizer-verbose=0" )
+        # 这里省略了 ‘-Ofast -lrt’ 参数，原本为 ‘-Ofast -lrt -std=c++11 -DHAVE_CXX0X ...’
+      SET( CMAKE_CXX_FLAGS  "-Ofast -std=c++11 -DHAVE_CXX0X -march=native -fpic -w -fopenmp -ftree-vectorize -ftree-vectorizer-verbose=0" )
     elseif (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
       SET( CMAKE_CXX_FLAGS  "/O2 -DHAVE_CXX0X /W1 /openmp /EHsc" )
     endif()
 
     # examples
+    add_executable(labeled_search.cpp examples/cpp/labeled_search.cpp)
+    target_link_libraries(labeled_search.cpp hnswlib)
+
+    add_executable(level_generator_test examples/cpp/level_generator_test.cpp)
+    target_link_libraries(level_generator_test hnswlib)
+
+    add_executable(search_tiny_db examples/cpp/search_tiny_db.cpp)
+    target_link_libraries(search_tiny_db hnswlib)
+
     add_executable(example_search examples/cpp/example_search.cpp)
     target_link_libraries(example_search hnswlib)
 

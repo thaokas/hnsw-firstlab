@@ -1,7 +1,7 @@
 #pragma once
 
 #include "visited_list_pool.h"
-#include "hnswlib.h"
+#include <vector>
 #include <atomic>
 #include <random>
 #include <stdlib.h>
@@ -10,9 +10,11 @@
 #include <list>
 #include <memory>
 
+
 namespace hnswlib {
 typedef unsigned int tableint;
 typedef unsigned int linklistsizeint;
+typedef int divint;
 
 template<typename dist_t>
 class HierarchicalNSW : public AlgorithmInterface<dist_t> {
@@ -34,6 +36,11 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     double mult_{0.0}, revSize_{0.0};
     int maxlevel_{0};
 
+    double level_shaper_{2}; // 随机函数的上限
+    int distribute_number_{0}; // 待指定的分布式存储设备台数
+    int level_div_{0}; // 从哪一层开始分布式存储
+    int cur_device_number_{0}; // 用于控制分布式存储设备数量的上限
+
     std::unique_ptr<VisitedListPool> visited_list_pool_{nullptr};
 
     // Locks operations with element by label value
@@ -45,7 +52,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     tableint enterpoint_node_{0};
 
     size_t size_links_level0_{0};
-    size_t offsetData_{0}, offsetLevel0_{0}, label_offset_{ 0 };
+    size_t offsetData_{0}, offsetLevel0_{0}, label_offset_{0};
 
     char *data_level0_memory_{nullptr};
     char **linkLists_{nullptr};
@@ -59,6 +66,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     mutable std::mutex label_lookup_lock;  // lock for label_lookup_
     std::unordered_map<labeltype, tableint> label_lookup_;
 
+    mutable std::mutex domainer_lookup_lock; // i have no idea about this
+    std::unordered_map<labeltype, std::unordered_set<tableint>> domainer_lookup_;
+
     std::default_random_engine level_generator_;
     std::default_random_engine update_probability_generator_;
 
@@ -69,6 +79,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
     std::mutex deleted_elements_lock;  // lock for deleted_elements
     std::unordered_set<tableint> deleted_elements;  // contains internal ids of deleted elements
+
+    /* 0： 原本模式  | 1： 强制分两层 | 2： 让某一层为指定值 */
+    divint level_generator_kind_{0}; // 控制使用的数据库分层策略 默认为0
 
 
     HierarchicalNSW(SpaceInterface<dist_t> *s) {
@@ -143,6 +156,97 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         revSize_ = 1.0 / mult_;
     }
 
+    // 修改后的初始化函数在这里
+    HierarchicalNSW(
+        SpaceInterface<dist_t> *s,
+        size_t max_elements,
+        size_t M = 16,
+        size_t ef_construction = 200,
+        divint level_div_strategy = 0,
+        size_t distribution_size = -1,
+        size_t random_seed = 100,
+        bool allow_replace_deleted = false)
+        : label_op_locks_(MAX_LABEL_OPERATION_LOCKS),
+            link_list_locks_(max_elements),
+            element_levels_(max_elements),
+            distribute_number_(distribution_size),
+            level_generator_kind_(level_div_strategy),
+            allow_replace_deleted_(allow_replace_deleted) {
+        max_elements_ = max_elements;
+        num_deleted_ = 0;
+        data_size_ = s->get_data_size();
+        fstdistfunc_ = s->get_dist_func();
+        dist_func_param_ = s->get_dist_func_param();
+        if ( M <= 10000 ) {
+            M_ = M;
+        } else {
+            HNSWERR << "warning: M parameter exceeds 10000 which may lead to adverse effects." << std::endl;
+            HNSWERR << "         Cap to 10000 will be applied for the rest of the processing." << std::endl;
+            M_ = 10000;
+        }
+        maxM_ = M_;
+        maxM0_ = M_ * 2;
+        ef_construction_ = std::max(ef_construction, M_);
+        ef_ = 10;
+
+
+
+
+        // 保险起见，加两个检查判定
+        if (level_div_strategy == -1)
+            level_div_strategy = 0;
+
+        if (level_div_strategy > 2 || level_div_strategy < -1)
+        {
+            std::cout << "WARNING: level dividing strategy error. parameter \"level_div_strategy\" can not be " << level_div_strategy << std::endl;
+            std::cout << "          default strategy will be used for level generating." << std::endl;
+            level_generator_kind_ = 0;
+        }
+
+        if (distribute_number_ * 10 > max_elements_)
+        {
+            throw std::runtime_error("ERROR: too much distribution devices");
+        }
+
+        int lv_div = 0;
+        while (level_shaper_ >= 1)
+        {
+            level_shaper_ = max_elements / (pow(M_, lv_div) * distribute_number_);
+            lv_div += 1;
+        }
+        level_div_ = lv_div - 1;
+        std::cout << "level_shaper_ = " << level_shaper_ << " level_div_ = " << level_div_  << std::endl;
+        cur_device_number_ = 0;
+
+        level_generator_.seed(random_seed);
+        update_probability_generator_.seed(random_seed + 1);
+
+        size_links_level0_ = maxM0_ * sizeof(tableint) + sizeof(linklistsizeint);
+        size_data_per_element_ = size_links_level0_ + data_size_ + sizeof(labeltype);
+        offsetData_ = size_links_level0_;
+        label_offset_ = size_links_level0_ + data_size_;
+        offsetLevel0_ = 0;
+
+        data_level0_memory_ = (char *) malloc(max_elements_ * size_data_per_element_);
+        if (data_level0_memory_ == nullptr)
+            throw std::runtime_error("Not enough memory");
+
+        cur_element_count = 0;
+
+        visited_list_pool_ = std::unique_ptr<VisitedListPool>(new VisitedListPool(1, max_elements));
+
+        // initializations for special treatment of the first node
+        enterpoint_node_ = -1;
+        maxlevel_ = -1;
+
+        linkLists_ = (char **) malloc(sizeof(void *) * max_elements_);
+        if (linkLists_ == nullptr)
+            throw std::runtime_error("Not enough memory: HierarchicalNSW failed to allocate linklists");
+        size_links_per_element_ = maxM_ * sizeof(tableint) + sizeof(linklistsizeint);
+        mult_ = 1 / log(1.0 * M_);
+        revSize_ = 1.0 / mult_;
+    }
+
 
     ~HierarchicalNSW() {
         clear();
@@ -166,6 +270,13 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         constexpr bool operator()(std::pair<dist_t, tableint> const& a,
             std::pair<dist_t, tableint> const& b) const noexcept {
             return a.first < b.first;
+        }
+    };
+
+    struct CompareByLabel {
+        constexpr bool operator()(labeltype const& a,
+            labeltype const& b) const noexcept {
+            return a < b;
         }
     };
 
@@ -203,11 +314,50 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         return (data_level0_memory_ + internal_id * size_data_per_element_ + offsetData_);
     }
 
+    int getRandomLevel(double reverse_size)
+    {
+        if (level_generator_kind_ == 0)
+            return getRandomLevelOriginal(reverse_size);
+        else if (level_generator_kind_ == 1)
+            return getRandomLevelwithLevelPress();
+        else if (level_generator_kind_ == 2)
+            return getRandomLevelwithFixedLS(reverse_size);
+    }
 
-    int getRandomLevel(double reverse_size) {
+    int getRandomLevelOriginal(double reverse_size) {
         std::uniform_real_distribution<double> distribution(0.0, 1.0);
         double r = -log(distribution(level_generator_)) * reverse_size;
         return (int) r;
+    }
+
+    // 将层数控制在两层
+    // 同时使第一层为指定的数目
+    int getRandomLevelwithLevelPress() {
+        double top_shaper = max_elements_ * 1.0 / distribute_number_ + 1;
+        std::uniform_real_distribution<double> distribution(0.0, top_shaper);
+        int r = (int) distribution(level_generator_);
+        r = r > 0 ? 1 : 0;
+        return r;
+    }
+
+    // 使得某一层会有固定数量的向量
+    int getRandomLevelwithFixedLS(double reverse_size) {
+        if (level_shaper_ >= 1)
+            return getRandomLevelOriginal(reverse_size);
+
+        std::uniform_real_distribution<double> distribution(0.0, level_shaper_);
+        double r = -log(distribution(level_generator_)) * reverse_size;
+        int level = int(r);
+
+        if (level >= level_div_)
+        {
+            if (cur_device_number_ >= distribute_number_)
+                level = level_div_ - 1;
+            else
+                cur_device_number_ += 1;
+        }
+
+        return level;
     }
 
     size_t getMaxElements() {
@@ -404,6 +554,426 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 #endif
 
                         if (bare_bone_search || 
+                            (!isMarkedDeleted(candidate_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(candidate_id))))) {
+                            top_candidates.emplace(dist, candidate_id);
+                            if (!bare_bone_search && stop_condition) {
+                                stop_condition->add_point_to_result(getExternalLabel(candidate_id), currObj1, dist);
+                            }
+                        }
+
+                        bool flag_remove_extra = false;
+                        if (!bare_bone_search && stop_condition) {
+                            flag_remove_extra = stop_condition->should_remove_extra();
+                        } else {
+                            flag_remove_extra = top_candidates.size() > ef;
+                        }
+                        while (flag_remove_extra) {
+                            tableint id = top_candidates.top().second;
+                            top_candidates.pop();
+                            if (!bare_bone_search && stop_condition) {
+                                stop_condition->remove_point_from_result(getExternalLabel(id), getDataByInternalId(id), dist);
+                                flag_remove_extra = stop_condition->should_remove_extra();
+                            } else {
+                                flag_remove_extra = top_candidates.size() > ef;
+                            }
+                        }
+
+                        if (!top_candidates.empty())
+                            lowerBound = top_candidates.top().first;
+                    }
+                }
+            }
+        }
+
+        visited_list_pool_->releaseVisitedList(vl);
+        return top_candidates;
+    }
+
+    template <bool bare_bone_search = true, bool collect_metrics = false>
+    std::pair<std::unordered_set<labeltype>, std::pair<dist_t, tableint>>
+    searchBaseLayerSTwithLabeling(
+        tableint ep_id,
+        const void *data_point,
+        size_t ef,
+        BaseFilterFunctor* isIdAllowed = nullptr,
+        BaseSearchStopCondition<dist_t>* stop_condition = nullptr) const {
+
+        VisitedList *vl = visited_list_pool_->getFreeVisitedList();
+        vl_type *visited_array = vl->mass;
+        vl_type visited_array_tag = vl->curV;
+
+        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
+        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidate_set;
+        std::unordered_set<labeltype> visited_device;
+
+        dist_t lowerBound;
+        if (bare_bone_search ||
+            (!isMarkedDeleted(ep_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(ep_id))))) {
+            char* ep_data = getDataByInternalId(ep_id);
+            dist_t dist = fstdistfunc_(data_point, ep_data, dist_func_param_);
+            lowerBound = dist;
+            top_candidates.emplace(dist, ep_id);
+            if (!bare_bone_search && stop_condition) {
+                stop_condition->add_point_to_result(getExternalLabel(ep_id), ep_data, dist);
+            }
+            candidate_set.emplace(-dist, ep_id);
+        } else {
+            lowerBound = std::numeric_limits<dist_t>::max();
+            candidate_set.emplace(-lowerBound, ep_id);
+        }
+
+        visited_array[ep_id] = visited_array_tag;
+
+        while (!candidate_set.empty()) {
+            std::pair<dist_t, tableint> current_node_pair = candidate_set.top();
+            dist_t candidate_dist = -current_node_pair.first;
+
+            bool flag_stop_search;
+            if (bare_bone_search) {
+                flag_stop_search = candidate_dist > lowerBound;
+            } else {
+                if (stop_condition) {
+                    flag_stop_search = stop_condition->should_stop_search(candidate_dist, lowerBound);
+                } else {
+                    flag_stop_search = candidate_dist > lowerBound && top_candidates.size() == ef;
+                }
+            }
+            if (flag_stop_search) {
+                break;
+            }
+            candidate_set.pop();
+
+            tableint current_node_id = current_node_pair.second;
+            int *data = (int *) get_linklist0(current_node_id);
+            size_t size = getListCount((linklistsizeint*)data);
+//                bool cur_node_deleted = isMarkedDeleted(current_node_id);
+            if (collect_metrics) {
+                metric_hops++;
+                metric_distance_computations+=size;
+            }
+
+#ifdef USE_SSE
+            _mm_prefetch((char *) (visited_array + *(data + 1)), _MM_HINT_T0);
+            _mm_prefetch((char *) (visited_array + *(data + 1) + 64), _MM_HINT_T0);
+            _mm_prefetch(data_level0_memory_ + (*(data + 1)) * size_data_per_element_ + offsetData_, _MM_HINT_T0);
+            _mm_prefetch((char *) (data + 2), _MM_HINT_T0);
+#endif
+
+            for (size_t j = 1; j <= size; j++) {
+                int candidate_id = *(data + j);
+                visited_device.emplace(distribution_mapper.find(candidate_id)->second);
+//                    if (candidate_id == 0) continue;
+#ifdef USE_SSE
+                _mm_prefetch((char *) (visited_array + *(data + j + 1)), _MM_HINT_T0);
+                _mm_prefetch(data_level0_memory_ + (*(data + j + 1)) * size_data_per_element_ + offsetData_,
+                                _MM_HINT_T0);  ////////////
+#endif
+                if (!(visited_array[candidate_id] == visited_array_tag)) {
+                    visited_array[candidate_id] = visited_array_tag;
+
+                    char *currObj1 = (getDataByInternalId(candidate_id));
+                    dist_t dist = fstdistfunc_(data_point, currObj1, dist_func_param_);
+
+                    bool flag_consider_candidate;
+                    if (!bare_bone_search && stop_condition) {
+                        flag_consider_candidate = stop_condition->should_consider_candidate(dist, lowerBound);
+                    } else {
+                        flag_consider_candidate = top_candidates.size() < ef || lowerBound > dist;
+                    }
+
+                    if (flag_consider_candidate) {
+                        candidate_set.emplace(-dist, candidate_id);
+#ifdef USE_SSE
+                        _mm_prefetch(data_level0_memory_ + candidate_set.top().second * size_data_per_element_ +
+                                        offsetLevel0_,  ///////////
+                                        _MM_HINT_T0);  ////////////////////////
+#endif
+
+                        if (bare_bone_search ||
+                            (!isMarkedDeleted(candidate_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(candidate_id))))) {
+                            top_candidates.emplace(dist, candidate_id);
+                            if (!bare_bone_search && stop_condition) {
+                                stop_condition->add_point_to_result(getExternalLabel(candidate_id), currObj1, dist);
+                            }
+                        }
+
+                        bool flag_remove_extra = false;
+                        if (!bare_bone_search && stop_condition) {
+                            flag_remove_extra = stop_condition->should_remove_extra();
+                        } else {
+                            flag_remove_extra = top_candidates.size() > ef;
+                        }
+                        while (flag_remove_extra) {
+                            tableint id = top_candidates.top().second;
+                            top_candidates.pop();
+                            if (!bare_bone_search && stop_condition) {
+                                stop_condition->remove_point_from_result(getExternalLabel(id), getDataByInternalId(id), dist);
+                                flag_remove_extra = stop_condition->should_remove_extra();
+                            } else {
+                                flag_remove_extra = top_candidates.size() > ef;
+                            }
+                        }
+
+                        if (!top_candidates.empty())
+                            lowerBound = top_candidates.top().first;
+                    }
+                }
+            }
+        }
+
+        visited_list_pool_->releaseVisitedList(vl);
+        while (top_candidates.size() > 1)
+            top_candidates.pop();
+
+        return std::pair<std::unordered_set<labeltype>, std::pair<dist_t, tableint>>(visited_device, top_candidates.top());
+    }
+
+    // bare_bone_search means there is no check for deletions and stop condition is ignored in return of extra performance
+    template <bool bare_bone_search = true, bool collect_metrics = false>
+    std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst>
+    searchNLayerST(
+        tableint ep_id,
+        const void *data_point,
+        size_t ef,
+        int targetLevel,
+        BaseFilterFunctor* isIdAllowed = nullptr,
+        BaseSearchStopCondition<dist_t>* stop_condition = nullptr) const {
+
+        // set visited record
+        VisitedList *vl = visited_list_pool_->getFreeVisitedList();
+        vl_type *visited_array = vl->mass;
+        vl_type visited_array_tag = vl->curV;
+
+        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
+        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidate_set;
+
+        // set start condition
+        dist_t lowerBound;
+        if (bare_bone_search ||
+            (!isMarkedDeleted(ep_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(ep_id))))) {
+            char* ep_data = getDataByInternalId(ep_id);
+            dist_t dist = fstdistfunc_(data_point, ep_data, dist_func_param_);
+            lowerBound = dist;
+            top_candidates.emplace(dist, ep_id);
+            if (!bare_bone_search && stop_condition) {
+                stop_condition->add_point_to_result(getExternalLabel(ep_id), ep_data, dist);
+            }
+            candidate_set.emplace(-dist, ep_id);
+        } else {
+            lowerBound = std::numeric_limits<dist_t>::max();
+            candidate_set.emplace(-lowerBound, ep_id);
+        }
+
+        visited_array[ep_id] = visited_array_tag;
+
+        // search in target layer(level)
+        while (!candidate_set.empty()) {
+            std::pair<dist_t, tableint> current_node_pair = candidate_set.top();
+            dist_t candidate_dist = -current_node_pair.first;
+
+            bool flag_stop_search;
+            if (bare_bone_search) {
+                flag_stop_search = candidate_dist > lowerBound;
+            } else {
+                if (stop_condition) {
+                    flag_stop_search = stop_condition->should_stop_search(candidate_dist, lowerBound);
+                } else {
+                    flag_stop_search = candidate_dist > lowerBound && top_candidates.size() == ef;
+                }
+            }
+            if (flag_stop_search) {
+                break;
+            }
+            candidate_set.pop();
+
+            tableint current_node_id = current_node_pair.second;
+            int *data = (int *) get_linklist(current_node_id, targetLevel);
+            size_t size = getListCount((linklistsizeint*)data);
+            if (collect_metrics) {
+                metric_hops++;
+                metric_distance_computations+=size;
+            }
+
+#ifdef USE_SSE
+            _mm_prefetch((char *) (visited_array + *(data + 1)), _MM_HINT_T0);
+            _mm_prefetch((char *) (visited_array + *(data + 1) + 64), _MM_HINT_T0);
+            _mm_prefetch(data_level0_memory_ + (*(data + 1)) * size_data_per_element_ + offsetData_, _MM_HINT_T0);
+            _mm_prefetch((char *) (data + 2), _MM_HINT_T0);
+#endif
+
+            for (size_t j = 1; j <= size; j++) {
+                int candidate_id = *(data + j);
+//                    if (candidate_id == 0) continue;
+#ifdef USE_SSE
+                _mm_prefetch((char *) (visited_array + *(data + j + 1)), _MM_HINT_T0);
+                _mm_prefetch(data_level0_memory_ + (*(data + j + 1)) * size_data_per_element_ + offsetData_,
+                                _MM_HINT_T0);  ////////////
+#endif
+                if (!(visited_array[candidate_id] == visited_array_tag)) {
+                    visited_array[candidate_id] = visited_array_tag;
+
+                    char *currObj1 = (getDataByInternalId(candidate_id));
+                    dist_t dist = fstdistfunc_(data_point, currObj1, dist_func_param_);
+
+                    bool flag_consider_candidate;
+                    if (!bare_bone_search && stop_condition) {
+                        flag_consider_candidate = stop_condition->should_consider_candidate(dist, lowerBound);
+                    } else {
+                        flag_consider_candidate = top_candidates.size() < ef || lowerBound > dist;
+                    }
+
+                    if (flag_consider_candidate) {
+                        candidate_set.emplace(-dist, candidate_id);
+#ifdef USE_SSE
+                        _mm_prefetch(data_level0_memory_ + candidate_set.top().second * size_data_per_element_ +
+                                        offsetLevel0_,  ///////////
+                                        _MM_HINT_T0);  ////////////////////////
+#endif
+
+                        if (bare_bone_search ||
+                            (!isMarkedDeleted(candidate_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(candidate_id))))) {
+                            top_candidates.emplace(dist, candidate_id);
+                            if (!bare_bone_search && stop_condition) {
+                                stop_condition->add_point_to_result(getExternalLabel(candidate_id), currObj1, dist);
+                            }
+                        }
+
+                        bool flag_remove_extra = false;
+                        if (!bare_bone_search && stop_condition) {
+                            flag_remove_extra = stop_condition->should_remove_extra();
+                        } else {
+                            flag_remove_extra = top_candidates.size() > ef;
+                        }
+                        while (flag_remove_extra) {
+                            tableint id = top_candidates.top().second;
+                            top_candidates.pop();
+                            if (!bare_bone_search && stop_condition) {
+                                stop_condition->remove_point_from_result(getExternalLabel(id), getDataByInternalId(id), dist);
+                                flag_remove_extra = stop_condition->should_remove_extra();
+                            } else {
+                                flag_remove_extra = top_candidates.size() > ef;
+                            }
+                        }
+
+                        if (!top_candidates.empty())
+                            lowerBound = top_candidates.top().first;
+                    }
+                }
+            }
+        }
+
+        visited_list_pool_->releaseVisitedList(vl);
+        return top_candidates;
+    }
+
+
+    // bare_bone_search means there is no check for deletions and stop condition is ignored in return of extra performance
+    template <bool bare_bone_search = true, bool collect_metrics = false>
+    std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst>
+    searchBaseLayerSTwithRecord(
+        tableint ep_id,
+        const void *data_point,
+        size_t ef,
+        labeltype domainer_label,
+        BaseFilterFunctor* isIdAllowed = nullptr,
+        BaseSearchStopCondition<dist_t>* stop_condition = nullptr){
+        VisitedList *vl = visited_list_pool_->getFreeVisitedList();
+        vl_type *visited_array = vl->mass;
+        vl_type visited_array_tag = vl->curV;
+
+        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
+        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidate_set;
+
+        dist_t lowerBound;
+        if (bare_bone_search ||
+            (!isMarkedDeleted(ep_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(ep_id))))) {
+            char* ep_data = getDataByInternalId(ep_id);
+            dist_t dist = fstdistfunc_(data_point, ep_data, dist_func_param_);
+            lowerBound = dist;
+            top_candidates.emplace(dist, ep_id);
+            if (!bare_bone_search && stop_condition) {
+                stop_condition->add_point_to_result(getExternalLabel(ep_id), ep_data, dist);
+            }
+            candidate_set.emplace(-dist, ep_id);
+        } else {
+            lowerBound = std::numeric_limits<dist_t>::max();
+            candidate_set.emplace(-lowerBound, ep_id);
+        }
+
+        visited_array[ep_id] = visited_array_tag;
+
+        while (!candidate_set.empty()) {
+            std::pair<dist_t, tableint> current_node_pair = candidate_set.top();
+            dist_t candidate_dist = -current_node_pair.first;
+
+            bool flag_stop_search;
+            if (bare_bone_search) {
+                flag_stop_search = candidate_dist > lowerBound;
+            } else {
+                if (stop_condition) {
+                    flag_stop_search = stop_condition->should_stop_search(candidate_dist, lowerBound);
+                } else {
+                    flag_stop_search = candidate_dist > lowerBound && top_candidates.size() == ef;
+                }
+            }
+            if (flag_stop_search) {
+                break;
+            }
+            candidate_set.pop();
+
+            tableint current_node_id = current_node_pair.second;
+            int *data = (int *) get_linklist0(current_node_id);
+            size_t size = getListCount((linklistsizeint*)data);
+//                bool cur_node_deleted = isMarkedDeleted(current_node_id);
+            if (collect_metrics) {
+                metric_hops++;
+                metric_distance_computations+=size;
+            }
+
+#ifdef USE_SSE
+            _mm_prefetch((char *) (visited_array + *(data + 1)), _MM_HINT_T0);
+            _mm_prefetch((char *) (visited_array + *(data + 1) + 64), _MM_HINT_T0);
+            _mm_prefetch(data_level0_memory_ + (*(data + 1)) * size_data_per_element_ + offsetData_, _MM_HINT_T0);
+            _mm_prefetch((char *) (data + 2), _MM_HINT_T0);
+#endif
+
+            for (size_t j = 1; j <= size; j++) {
+                int candidate_id = *(data + j);
+
+                // mycode
+                // /* fast comments
+                std::unique_lock<std::mutex> my_lock_table(domainer_lookup_lock);
+                domainer_lookup_[getExternalLabel(candidate_id)].emplace(domainer_label);
+                my_lock_table.unlock();
+                // */
+//                    if (candidate_id == 0) continue;
+#ifdef USE_SSE
+                _mm_prefetch((char *) (visited_array + *(data + j + 1)), _MM_HINT_T0);
+                _mm_prefetch(data_level0_memory_ + (*(data + j + 1)) * size_data_per_element_ + offsetData_,
+                                _MM_HINT_T0);  ////////////
+#endif
+                if (!(visited_array[candidate_id] == visited_array_tag)) {
+                    visited_array[candidate_id] = visited_array_tag;
+
+                    char *currObj1 = (getDataByInternalId(candidate_id));
+                    dist_t dist = fstdistfunc_(data_point, currObj1, dist_func_param_);
+
+                    bool flag_consider_candidate;
+                    if (!bare_bone_search && stop_condition) {
+                        flag_consider_candidate = stop_condition->should_consider_candidate(dist, lowerBound);
+                    } else {
+                        flag_consider_candidate = top_candidates.size() < ef || lowerBound > dist;
+                    }
+
+                    if (flag_consider_candidate) {
+                        candidate_set.emplace(-dist, candidate_id);
+#ifdef USE_SSE
+                        _mm_prefetch(data_level0_memory_ + candidate_set.top().second * size_data_per_element_ +
+                                        offsetLevel0_,  ///////////
+                                        _MM_HINT_T0);  ////////////////////////
+#endif
+
+                        if (bare_bone_search ||
                             (!isMarkedDeleted(candidate_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(candidate_id))))) {
                             top_candidates.emplace(dist, candidate_id);
                             if (!bare_bone_search && stop_condition) {
@@ -1267,6 +1837,11 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
 
+    // /* my decleration for experiment */
+    // std::map<labeltype, std::vector<labeltype>> domain_relation;
+    // /* end of my coode */
+
+    // 原本的 knn 函数
     std::priority_queue<std::pair<dist_t, labeltype >>
     searchKnn(const void *query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr) const {
         std::priority_queue<std::pair<dist_t, labeltype >> result;
@@ -1274,6 +1849,339 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         tableint currObj = enterpoint_node_;
         dist_t curdist = fstdistfunc_(query_data, getDataByInternalId(enterpoint_node_), dist_func_param_);
+
+        // std::queue<std::pair<int, labeltype>> search_track;
+        // search_track.emplace(std::make_pair(maxlevel_, currObj));
+
+
+        for (int level = maxlevel_; level > 0; level--) {
+            bool changed = true;
+            while (changed) {
+                changed = false;
+                unsigned int *data;
+
+                data = (unsigned int *) get_linklist(currObj, level);
+                int size = getListCount(data);
+                metric_hops++;
+                metric_distance_computations+=size;
+
+                tableint *datal = (tableint *) (data + 1);
+                for (int i = 0; i < size; i++)
+                {
+                    tableint cand = datal[i];
+                    if (cand < 0 || cand > max_elements_)
+                        throw std::runtime_error("cand error");
+                    dist_t d = fstdistfunc_(query_data, getDataByInternalId(cand), dist_func_param_);
+
+                    if (d < curdist) {
+                        curdist = d;
+                        currObj = cand;
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+
+        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
+        bool bare_bone_search = !num_deleted_ && !isIdAllowed;
+        if (bare_bone_search) {
+            top_candidates = searchBaseLayerST<true>(
+                    currObj, query_data, std::max(ef_, k), isIdAllowed);
+        } else {
+            top_candidates = searchBaseLayerST<false>(
+                    currObj, query_data, std::max(ef_, k), isIdAllowed);
+        }
+
+        while (top_candidates.size() > k) {
+            top_candidates.pop();
+        }
+        while (top_candidates.size() > 0) {
+            std::pair<dist_t, tableint> rez = top_candidates.top();
+            result.push(std::pair<dist_t, labeltype>(rez.first, getExternalLabel(rez.second)));
+            top_candidates.pop();
+        }
+
+        return result;
+    }
+
+    // 将 knn 变成 top 1 搜索， 同时记录这次搜索过程中，涉及到的向量的覆盖范围。
+    std::pair<std::unordered_set<labeltype>, labeltype> searchGrandTruth (const void *query_data, BaseFilterFunctor* isIdAllowed = nullptr) const
+    {
+        std::unordered_set<labeltype> visited_distributer_set;
+
+        if (cur_element_count == 0)
+            throw std::runtime_error("没添加向量你搜索个啥子。。。");
+
+        tableint currObj = enterpoint_node_;
+        dist_t curdist = fstdistfunc_(query_data, getDataByInternalId(enterpoint_node_), dist_func_param_);
+
+
+        for (int level = maxlevel_; level > 0; level--) {
+            bool changed = true;
+            while (changed)
+            {
+                changed = false;
+                unsigned int *data;
+
+                data = (unsigned int *) get_linklist(currObj, level);
+                int size = getListCount(data);
+                metric_hops++;
+                metric_distance_computations+=size;
+
+                tableint *datal = (tableint *) (data + 1);
+
+                // 记录搜索设备的代码部分
+                if (level < level_div_)
+                {
+                    for (int i = 0; i < size; ++i)
+                    {
+                        tableint obj = datal[i];
+                        labeltype distribution_device = distribution_mapper.find(obj)->second;
+                        visited_distributer_set.emplace(distribution_device);
+                    }
+                }
+
+                for (int i = 0; i < size; i++) {
+                    tableint cand = datal[i];
+                    if (cand < 0 || cand > max_elements_)
+                        throw std::runtime_error("cand error");
+                    dist_t d = fstdistfunc_(query_data, getDataByInternalId(cand), dist_func_param_);
+
+                    if (d < curdist) {
+                        curdist = d;
+                        currObj = cand;
+                        changed = true;
+                    }
+                }
+            }
+            if (level == level_div_)
+                visited_distributer_set.emplace(distribution_mapper.find(currObj)->second);
+        }
+
+        std::pair<std::unordered_set<labeltype>, tableint> baseLayer_search_result;
+        bool bare_bone_search = !num_deleted_ && !isIdAllowed;
+        if (bare_bone_search) {
+            baseLayer_search_result = searchBaseLayerSTwithLabeling<true>(
+                    currObj, query_data, std::max(ef_, size_t(1)), isIdAllowed);
+        } else {
+            baseLayer_search_result = searchBaseLayerSTwithLabeling<false>(
+                    currObj, query_data, std::max(ef_, size_t(1)), isIdAllowed);
+        }
+
+        for (auto item : baseLayer_search_result.first)
+        {
+            visited_distributer_set.emplace(item);
+        }
+
+        return std::pair<std::unordered_set<labeltype>, labeltype>(visited_distributer_set, baseLayer_search_result.second);
+    }
+
+    // 自己魔改的函数，添加了在 level 1 层进行一次 knn 的操作
+    std::pair<std::unordered_set<labeltype>, std::pair<dist_t, tableint>>
+    searchGTwithKBsearch(const void *query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr)
+    {
+        if (cur_element_count == 0)
+            throw std::runtime_error("empty vector database");
+        if (level_generator_kind_ != 2)
+            throw std::runtime_error("wrong level generating strategy");
+
+        std::unordered_set<labeltype> visited_distributer_set;
+        tableint currObj = enterpoint_node_;
+        dist_t curdist = fstdistfunc_(query_data, getDataByInternalId(enterpoint_node_), dist_func_param_);
+
+
+        int bottom = 0;
+        if (level_generator_kind_ == 0) bottom = 0;
+        else if (level_generator_kind_ == 1) bottom = 1;
+        else if (level_generator_kind_ == 2) bottom = level_div_;
+
+        for (int level = maxlevel_; level > bottom; level--) {
+            bool changed = true;
+            while (changed) {
+                changed = false;
+                unsigned int *data;
+
+                data = (unsigned int *) get_linklist(currObj, level);
+                int size = getListCount(data);
+                metric_hops++;
+                metric_distance_computations+=size;
+
+                tableint *datal = (tableint *) (data + 1);
+                for (int i = 0; i < size; i++) {
+                    tableint cand = datal[i];
+                    if (cand < 0 || cand > max_elements_)
+                        throw std::runtime_error("cand error");
+                    dist_t d = fstdistfunc_(query_data, getDataByInternalId(cand), dist_func_param_);
+
+                    if (d < curdist) {
+                        curdist = d;
+                        currObj = cand;
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> k_board_entries;
+        k_board_entries = searchNLayerST(currObj, query_data, std::max(ef_, k), level_div_, isIdAllowed);
+
+        // 扩展后先使用贪心搜索，然后使用在最底层使用nsw
+        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
+        std::priority_queue<labeltype, std::vector<labeltype>, CompareByLabel> k_board_save;
+        bool bare_bone_search = !num_deleted_ && !isIdAllowed;
+        while (k_board_entries.size() > k)
+            k_board_entries.pop();
+
+        while (k_board_entries.size() > 0)
+        {
+            tableint currEp = k_board_entries.top().second;
+            dist_t sub_curdist = k_board_entries.top().first;
+            k_board_entries.pop();
+
+            visited_distributer_set.emplace(distribution_mapper.find(currEp)->second);
+            // 这是一行用来记录搜索覆盖范围的代码
+            // labeltype domainer_record = getExternalLabel(k_board_entries.top().second)
+
+            // 贪心获取 level 0 的 nsw 入口节点 （currEp）
+            for (int level = level_div_ - 1; level > 0 ; --level)
+            {
+                bool changed = true;
+                while (changed)
+                {
+                    changed = false;
+                    unsigned int *data;
+
+                    data = (unsigned int *) get_linklist(currEp, level);
+                    visited_distributer_set.emplace(distribution_mapper.find(currEp)->second);
+                    int size = getListCount(data);
+                    metric_hops++;
+                    metric_distance_computations += size;
+
+                    tableint *datal = (tableint *) (data + 1);
+                    for (int i = 0; i < size; ++i)
+                    {
+                        tableint cand = datal[i];
+                        if (cand < 0 || cand > max_elements_)
+                            throw std::runtime_error("cand error");
+                        dist_t d = fstdistfunc_(query_data, getDataByInternalId(cand), dist_func_param_);
+
+                        // my code
+                        // record visited nodes in greedy search
+                        /* fast notation
+                        std::unique_lock<std::mutex> my_lock_table(domainer_lookup_lock);
+                        domainer_lookup_[getExternalLabel(cand)].emplace(domainer_record);
+                        my_lock_table.unlock();
+                        // */
+                        visited_distributer_set.emplace(distribution_mapper.find(cand)->second);
+
+                        if (d < sub_curdist)
+                        {
+                            sub_curdist = d;
+                            currEp = cand;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+
+            std::pair<std::unordered_set<labeltype>, std::pair<dist_t, tableint>> baseLayer_search_result;
+            if (bare_bone_search) {
+                baseLayer_search_result = searchBaseLayerSTwithLabeling<true>(
+                        currEp, query_data, std::max(ef_, size_t(1)), isIdAllowed);
+            } else {
+                baseLayer_search_result = searchBaseLayerSTwithLabeling<false>(
+                        currEp, query_data, std::max(ef_, size_t(1)), isIdAllowed);
+            }
+            for (auto item : baseLayer_search_result.first)
+                visited_distributer_set.emplace(item);
+
+            top_candidates.push(baseLayer_search_result.second);
+        }
+
+        while (top_candidates.size() > 1)
+            top_candidates.pop();
+
+
+        return std::pair<std::unordered_set<labeltype>, std::pair<dist_t, tableint>>(visited_distributer_set, top_candidates.top());
+
+    }
+
+    // 搜索指定向量，同时返回这个向量在分区层的 k 个最邻近点
+    std::vector<std::pair<dist_t, labeltype>> searchInDivLayer
+    (const void *query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr) const
+    {
+        if (cur_element_count == 0)
+            throw std::runtime_error("empty vector database");
+        if (level_generator_kind_ != 2)
+            throw std::runtime_error("wrong level generating strategy");
+
+        std::unordered_set<labeltype> visited_distributer_set;
+        tableint currObj = enterpoint_node_;
+        dist_t curdist = fstdistfunc_(query_data, getDataByInternalId(enterpoint_node_), dist_func_param_);
+
+
+        int bottom = 0;
+        if (level_generator_kind_ == 0) bottom = 0;
+        else if (level_generator_kind_ == 1) bottom = 1;
+        else if (level_generator_kind_ == 2) bottom = level_div_;
+
+        for (int level = maxlevel_; level > bottom; level--) {
+            bool changed = true;
+            while (changed) {
+                changed = false;
+                unsigned int *data;
+
+                data = (unsigned int *) get_linklist(currObj, level);
+                int size = getListCount(data);
+                metric_hops++;
+                metric_distance_computations+=size;
+
+                tableint *datal = (tableint *) (data + 1);
+                for (int i = 0; i < size; i++) {
+                    tableint cand = datal[i];
+                    if (cand < 0 || cand > max_elements_)
+                        throw std::runtime_error("cand error");
+                    dist_t d = fstdistfunc_(query_data, getDataByInternalId(cand), dist_func_param_);
+
+                    if (d < curdist) {
+                        curdist = d;
+                        currObj = cand;
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> k_board_entries;
+        k_board_entries = searchNLayerST(currObj, query_data, std::max(ef_, k), level_div_, isIdAllowed);
+
+        while (k_board_entries.size() > k)
+            k_board_entries.pop();
+
+        std::vector<std::pair<dist_t, labeltype>> result;
+        size_t sz = k_board_entries.size();
+        result.resize(sz);
+        while (k_board_entries.size() > 0)
+        {
+            result[--sz] = k_board_entries.top();
+            k_board_entries.pop();
+        }
+
+        return result;
+    }
+
+    std::priority_queue<std::pair<dist_t, labeltype >>
+    searchTopwithLabel(const void *query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr) const {
+        std::priority_queue<std::pair<dist_t, labeltype >> result;
+        if (cur_element_count == 0) return result;
+
+        tableint currObj = enterpoint_node_;
+        dist_t curdist = fstdistfunc_(query_data, getDataByInternalId(enterpoint_node_), dist_func_param_);
+
+        // std::queue<std::pair<int, labeltype>> search_track;
+        // search_track.emplace(std::make_pair(maxlevel_, currObj));
+
 
         for (int level = maxlevel_; level > 0; level--) {
             bool changed = true;
@@ -1302,6 +2210,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             }
         }
 
+
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
         bool bare_bone_search = !num_deleted_ && !isIdAllowed;
         if (bare_bone_search) {
@@ -1320,6 +2229,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             result.push(std::pair<dist_t, labeltype>(rez.first, getExternalLabel(rez.second)));
             top_candidates.pop();
         }
+
         return result;
     }
 
@@ -1408,5 +2318,73 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         }
         std::cout << "integrity ok, checked " << connections_checked << " connections\n";
     }
+
+    // 存储的是内部 id 和分布式存储器的外部 label
+    // 因为可以在搜索过后直接进行返回，所以选择了直接存储外部 label
+    // 实际上可以进行其他调整
+    std::unordered_map<tableint, labeltype> distribution_mapper;
+
+    // 下面这两个函数给每一个向量打上一个专有的分区标签
+    void RandomLabeler()
+    {
+        // 如果使用另一种标记方式，则先清空标记记录
+        if (!distribution_mapper.empty())
+            distribution_mapper.clear();
+
+        std::vector<labeltype> domainer_vector;
+        for (tableint i = 0; i < cur_element_count; ++i)
+        {
+            if (element_levels_[i] >= level_div_)
+                domainer_vector.push_back(getExternalLabel(i));
+        }
+
+        std::default_random_engine var;
+        var.seed(100);
+        for (tableint i = 0; i < cur_element_count; ++i)
+        {
+            std::uniform_real_distribution<double> t_generator(0, domainer_vector.size());
+            distribution_mapper[i] = (int) domainer_vector[t_generator(var)];
+        }
+
+        std::cout << "\ndomainer_size = " << domainer_vector.size() << std::endl;
+        for (auto item : domainer_vector)
+            std::cout << item << " | ";
+    }
+
+    // 这种标记方式分配不均匀，同时性能消耗比较大
+    void NearestLabeler()
+    {
+        if (!distribution_mapper.empty())
+            distribution_mapper.clear();
+
+        std::vector<tableint> domainer_vector;
+        for (tableint i = 0; i < cur_element_count; ++i)
+        {
+            if (element_levels_[i] >= level_div_)
+                domainer_vector.push_back(i);
+        }
+
+        for (tableint i = 0; i < cur_element_count; ++i)
+        {
+            const void* data_point = getDataByInternalId(i);
+            int nearest_index = 0;
+            dist_t d = fstdistfunc_(data_point, getDataByInternalId(domainer_vector[0]), dist_func_param_);
+            for (int j = 1; j < domainer_vector.size(); ++j)
+            {
+                tableint cand = domainer_vector[j];
+                dist_t temp_d = fstdistfunc_(data_point, getDataByInternalId(cand), dist_func_param_);
+                if (d > temp_d)
+                {
+                    d = temp_d;
+                    nearest_index = j;
+                }
+            }
+
+            distribution_mapper[i] = getExternalLabel(domainer_vector[nearest_index]);
+        }
+
+    }
+
+    size_t nodeWeight
 };
 }  // namespace hnswlib
