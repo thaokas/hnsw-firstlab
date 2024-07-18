@@ -107,10 +107,42 @@ void funtion(int _dim, int _max_elements, size_t _distribution_size) {
     // return 0;
 }
 
+void KMeansTest(int dim_, size_t max_elements_, hnswlib::centroidtype k_)
+{
+    int dim = dim_;
+    size_t max_elements = max_elements_;
+    hnswlib::centroidtype k = k_;
+    hnswlib::L2Space space(dim);
+    hnswlib::KMeamsSearch<float>* alg_kmeans = new hnswlib::KMeamsSearch<float>(&space, max_elements, k);
+
+    std::mt19937 rng;
+    rng.seed(47);
+    std::uniform_real_distribution<> distrib_real;
+    float* data = new float[dim * max_elements];
+    for (size_t i = 0; i < dim * max_elements; ++i)
+        data[i] = distrib_real(rng);
+
+    for (size_t i = 0; i < max_elements; ++i)
+    {
+        alg_kmeans->addPoint(data + i * dim, i);
+    }
+
+    alg_kmeans->generateKMeans();
+    std::cout << "---------------Generation end----------------" << std::endl;
+
+    // for (auto item : alg_kmeans->district_lool_up_)
+    //     std::cout << item.second << " | ";
+
+}
+
+
 int main(void)
 {
-    funtion(128, 200000, 400);
-    funtion(512, 200000, 400);
+    // funtion(128, 200000, 400);
+    // funtion(512, 200000, 400);
+    KMeansTest(128, 200000, 5);
+
+
     return 0;
 }
 

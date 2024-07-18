@@ -15,6 +15,8 @@ namespace hnswlib {
 typedef unsigned int tableint;
 typedef unsigned int linklistsizeint;
 typedef int divint;
+typedef size_t centroidtype;
+
 
 template<typename dist_t>
 class HierarchicalNSW : public AlgorithmInterface<dist_t> {
@@ -40,6 +42,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     int distribute_number_{0}; // 待指定的分布式存储设备台数
     int level_div_{0}; // 从哪一层开始分布式存储
     int cur_device_number_{0}; // 用于控制分布式存储设备数量的上限
+
+    // kmeans 标记的相关变量
+    int k_centroids{0};
+    char * centroids_data_{nullptr};
 
     std::unique_ptr<VisitedListPool> visited_list_pool_{nullptr};
 
@@ -160,6 +166,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     HierarchicalNSW(
         SpaceInterface<dist_t> *s,
         size_t max_elements,
+        int kmeans = 400,
         size_t M = 16,
         size_t ef_construction = 200,
         divint level_div_strategy = 0,
@@ -170,6 +177,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             link_list_locks_(max_elements),
             element_levels_(max_elements),
             distribute_number_(distribution_size),
+            k_centroids(kmeans),
             level_generator_kind_(level_div_strategy),
             allow_replace_deleted_(allow_replace_deleted) {
         max_elements_ = max_elements;
@@ -217,6 +225,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         level_div_ = lv_div - 1;
         std::cout << "level_shaper_ = " << level_shaper_ << " level_div_ = " << level_div_  << std::endl;
         cur_device_number_ = 0;
+
+
+        //
 
         level_generator_.seed(random_seed);
         update_probability_generator_.seed(random_seed + 1);
@@ -2385,6 +2396,84 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
     }
 
-    size_t nodeWeight
+    void KMeansLabeler()
+    {
+        std::default_random_engine rng;
+        rng.seed(32);
+        std::uniform_real_distribution<float> distrib_real;
+        float *tmp_cent_data = (float *)malloc(data_size_ * k_centroids);
+        for (centroidtype i = 0; i < k_centroids * data_size_ / sizeof(float); ++i)
+        {
+            tmp_cent_data[i] = distrib_real(rng);
+        }
+
+        std::unordered_map<centroidtype, std::vector<size_t>> means_n_times;
+
+        bool changed = true;
+        int rec_times = 0;
+        while (changed)
+        {
+            rec_times += 1;
+            for (tableint i = 0; i < cur_element_count; ++i)
+            {
+                char *currObj = getDataByInternalId(i);
+                centroidtype minIndex = 0;
+                dist_t d = fstdistfunc_(currObj, getCentroidDataByIndex(minIndex), dist_func_param_);
+                for (centroidtype j = 1; j < k_centroids; ++j)
+                {
+                    dist_t temp_d = fstdistfunc_(currObj, getCentroidDataByIndex(j), dist_func_param_);
+                    if (d > temp_d)
+                    {
+                        d = temp_d;
+                        minIndex = j;
+                    }
+                }
+                means_n_times[minIndex].push_back(i);
+            }
+
+            char *tmp_centroid_data = (char *)malloc(k_centroids * size_per_centroid_);
+            memset(tmp_centroid_data, 0, sizeof(tmp_centroid_data));
+
+            for (centroidtype i = 0; i < k_centroids; ++i)
+            {
+                for (int j = 0; j < means_n_times[i].size(); ++i)
+                {
+                    float *tptr = (float *)(tmp_centroid_data + size_per_centroid_ * i);
+                    float *tdata = (float *)getDataByIndex(means_n_times.find(i)->second[j]);
+                    for (size_t k = 0; k < *(size_t *)dist_func_param_; ++k)
+                    {
+                        tptr[k] = (tptr[k] * j + tdata[k]) / (j + 1);
+                    }
+                }
+            }
+
+            // for (centroidtype i = 0; i < k_centroids; ++i)
+            // {
+            //     std::cout << "[ centroid id = " << i << " | " << means_n_times[i].size() << " ]\n";
+            // }
+
+            if (memcmp(tmp_centroid_data, centroids_data_, sizeof(centroids_data_)) == 0)
+            {
+                changed = false;
+            }
+            else
+            {
+                delete[] centroids_data_;
+                centroids_data_ = tmp_centroid_data;
+                means_n_times.clear();
+            }
+        }
+
+        for (centroidtype i = 0; i < k_centroids; ++i)
+        {
+            for (auto item : means_n_times[i])
+            {
+                district_lool_up_[getExternalLabelByIndex(item)] = i;
+            }
+
+            std::cout << "[ centroid id = " << i << " | " << means_n_times[i].size() << " ]\n";
+        }
+        std::cout << "------" << rec_times << " times-------\n";
+    }
 };
 }  // namespace hnswlib
