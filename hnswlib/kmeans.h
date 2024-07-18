@@ -94,10 +94,10 @@ namespace hnswlib {
             std::default_random_engine rng;
             rng.seed(32);
             std::uniform_real_distribution<float> distrib_real;
-            float * tmp_cent_data = (float *)centroids_data_;
+            float *src_cent_ptr = (float *)centroids_data_;
             for (centroidtype i = 0; i < k_centroids * data_size_ / sizeof(float); ++i)
             {
-                tmp_cent_data[i] = distrib_real(rng);
+                src_cent_ptr[i] = distrib_real(rng);
             }
 
             std::unordered_map<centroidtype, std::vector<size_t>> means_n_times;
@@ -145,7 +145,7 @@ namespace hnswlib {
                 //     std::cout << "[ centroid id = " << i << " | " << means_n_times[i].size() << " ]\n";
                 // }
 
-                if (memcmp(tmp_centroid_data, centroids_data_, sizeof(centroids_data_)) == 0)
+                if (memcmp(tmp_centroid_data, centroids_data_, k_centroids * data_size_) == 0)
                 {
                     changed = false;
                 }

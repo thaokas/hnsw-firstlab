@@ -128,7 +128,52 @@ void KMeansTest(int dim_, size_t max_elements_, hnswlib::centroidtype k_)
     }
 
     alg_kmeans->generateKMeans();
-    std::cout << "---------------Generation end----------------" << std::endl;
+
+    // float *tptr = (float *)alg_kmeans->centroids_data_;
+    // size_t kmeans_size = alg_kmeans->k_centroids * alg_kmeans->data_size_ / sizeof(float);
+    // std::cout << kmeans_size << '\n';
+    // for (size_t i = 0; i < kmeans_size; ++i)
+    //     std::cout << tptr[i] << " ";
+
+    std::cout << "\n---------------Generation end----------------" << std::endl;
+
+    // for (auto item : alg_kmeans->district_lool_up_)
+    //     std::cout << item.second << " | ";
+
+}
+
+
+void KMeansLabelerTest(int dim_, size_t max_elements_, hnswlib::centroidtype k_, hnswlib::divint way)
+{
+    int dim = dim_;
+    size_t M = 16;
+    size_t ef_construction = 20;
+    size_t max_elements = max_elements_;
+    hnswlib::centroidtype k = k_;
+    hnswlib::divint div_strategy = way;
+    hnswlib::L2Space space(dim);
+    hnswlib::HierarchicalNSW<float>* alg_hnsw = new hnswlib::HierarchicalNSW<float>(&space, max_elements, k, M, ef_construction, div_strategy, -1);
+
+    std::mt19937 rng;
+    rng.seed(47);
+    std::uniform_real_distribution<> distrib_real;
+    float* data = new float[dim * max_elements];
+    for (size_t i = 0; i < dim * max_elements; ++i)
+        data[i] = distrib_real(rng);
+
+    for (size_t i = 0; i < max_elements; ++i)
+    {
+        alg_hnsw->addPoint(data + i * dim, i);
+    }
+
+    // hnswlib::DatabaseStructure<float>* assit = new hnswlib::DatabaseStructure<float>();
+    // assit->print_db_structure(alg_hnsw);
+    // assit->print_db_size(alg_hnsw);
+
+    alg_hnsw->KMeansLabeler();
+    std::cout << "\n---------------Generation end----------------" << std::endl;
+
+
 
     // for (auto item : alg_kmeans->district_lool_up_)
     //     std::cout << item.second << " | ";
@@ -140,7 +185,8 @@ int main(void)
 {
     // funtion(128, 200000, 400);
     // funtion(512, 200000, 400);
-    KMeansTest(128, 200000, 5);
+    // KMeansTest(128, 200000, 40);
+    KMeansLabelerTest(128, 20000, 20, 0);
 
 
     return 0;

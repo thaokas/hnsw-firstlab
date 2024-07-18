@@ -74,6 +74,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
     mutable std::mutex domainer_lookup_lock; // i have no idea about this
     std::unordered_map<labeltype, std::unordered_set<tableint>> domainer_lookup_;
+    std::unordered_map<labeltype, centroidtype> district_look_up_;
 
     std::default_random_engine level_generator_;
     std::default_random_engine update_probability_generator_;
@@ -211,7 +212,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             level_generator_kind_ = 0;
         }
 
-        if (distribute_number_ * 10 > max_elements_)
+        if (distribute_number_ > 0 && distribute_number_ * 10 > max_elements_)
         {
             throw std::runtime_error("ERROR: too much distribution devices");
         }
@@ -227,7 +228,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         cur_device_number_ = 0;
 
 
-        //
+        // kmeans related code
+        centroids_data_ = (char *)malloc(k_centroids * data_size_);
 
         level_generator_.seed(random_seed);
         update_probability_generator_.seed(random_seed + 1);
@@ -301,6 +303,11 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         // calculate hash
         size_t lock_id = label & (MAX_LABEL_OPERATION_LOCKS - 1);
         return label_op_locks_[lock_id];
+    }
+
+    inline char * getCentroidDataByIndex(centroidtype idx)
+    {
+        return centroids_data_ + idx * data_size_;
     }
 
 
@@ -2401,10 +2408,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         std::default_random_engine rng;
         rng.seed(32);
         std::uniform_real_distribution<float> distrib_real;
-        float *tmp_cent_data = (float *)malloc(data_size_ * k_centroids);
+        float *src_cent_ptr = (float *)centroids_data_;
         for (centroidtype i = 0; i < k_centroids * data_size_ / sizeof(float); ++i)
         {
-            tmp_cent_data[i] = distrib_real(rng);
+            src_cent_ptr[i] = distrib_real(rng);
         }
 
         std::unordered_map<centroidtype, std::vector<size_t>> means_n_times;
@@ -2431,15 +2438,15 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 means_n_times[minIndex].push_back(i);
             }
 
-            char *tmp_centroid_data = (char *)malloc(k_centroids * size_per_centroid_);
+            char *tmp_centroid_data = (char *)malloc(k_centroids * data_size_);
             memset(tmp_centroid_data, 0, sizeof(tmp_centroid_data));
 
             for (centroidtype i = 0; i < k_centroids; ++i)
             {
                 for (int j = 0; j < means_n_times[i].size(); ++i)
                 {
-                    float *tptr = (float *)(tmp_centroid_data + size_per_centroid_ * i);
-                    float *tdata = (float *)getDataByIndex(means_n_times.find(i)->second[j]);
+                    float *tptr = (float *)(tmp_centroid_data + data_size_ * i);
+                    float *tdata = (float *)getDataByInternalId(means_n_times.find(i)->second[j]);
                     for (size_t k = 0; k < *(size_t *)dist_func_param_; ++k)
                     {
                         tptr[k] = (tptr[k] * j + tdata[k]) / (j + 1);
@@ -2452,7 +2459,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             //     std::cout << "[ centroid id = " << i << " | " << means_n_times[i].size() << " ]\n";
             // }
 
-            if (memcmp(tmp_centroid_data, centroids_data_, sizeof(centroids_data_)) == 0)
+            if (memcmp(tmp_centroid_data, centroids_data_, k_centroids * data_size_) == 0)
             {
                 changed = false;
             }
@@ -2468,7 +2475,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         {
             for (auto item : means_n_times[i])
             {
-                district_lool_up_[getExternalLabelByIndex(item)] = i;
+                district_look_up_[getExternalLabel(item)] = i;
             }
 
             std::cout << "[ centroid id = " << i << " | " << means_n_times[i].size() << " ]\n";
